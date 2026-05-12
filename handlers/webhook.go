@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"idface-sync/config"
@@ -108,14 +109,13 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleMonitorDAO(w http.ResponseWriter, body []byte) {
-	// Extrai o user_id e portal_id do evento
 	var data struct {
 		ObjectChanges []struct {
 			Object string `json:"object"`
 			Type   string `json:"type"`
 			Values struct {
-				UserID   int `json:"user_id"`
-				PortalID int `json:"portal_id"`
+				UserID   string `json:"user_id"`
+				PortalID string `json:"portal_id"`
 			} `json:"values"`
 		} `json:"object_changes"`
 	}
@@ -130,12 +130,20 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 
 	for _, change := range data.ObjectChanges {
 		if change.Object == "access_logs" && change.Type == "inserted" {
-			userID := change.Values.UserID
-			portalID := change.Values.PortalID
+			userID, err := strconv.Atoi(change.Values.UserID)
+			if err != nil {
+				fmt.Printf("Erro ao converter user_id '%s': %v\n", change.Values.UserID, err)
+				continue
+			}
+			portalID, err := strconv.Atoi(change.Values.PortalID)
+			if err != nil {
+				fmt.Printf("Erro ao converter portal_id '%s': %v\n", change.Values.PortalID, err)
+				continue
+			}
 
 			// Busca estado atual no banco
 			var status string
-			err := database.DB.QueryRow("SELECT status FROM user_session WHERE user_id = $1", userID).Scan(&status)
+			err = database.DB.QueryRow("SELECT status FROM user_session WHERE user_id = $1", userID).Scan(&status)
 			if err == sql.ErrNoRows {
 				status = "outside"
 			} else if err != nil {
@@ -145,25 +153,20 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 
 			if portalID == ENTRADA_PORTAL {
 				if status == "inside" {
-					// Já está dentro, não deveria ter entrado. Mas ocorreu. Vamos desabilitar o usuário para evitar próximas entradas.
 					fmt.Printf("⚠️ Usuário %d tentou entrar novamente. Desabilitando no dispositivo.\n", userID)
 					go disableUserOnDevice(userID)
-					// Não muda status no banco (continua inside)
 				} else {
-					// Primeira entrada: atualiza status e desabilita usuário no dispositivo
 					_, err = database.DB.Exec(`INSERT INTO user_session (user_id, status, last_portal_id, last_event_time)
-						VALUES ($1, 'inside', $2, NOW())
-						ON CONFLICT (user_id) DO UPDATE SET status = 'inside', last_portal_id = $2, last_event_time = NOW()`,
+                        VALUES ($1, 'inside', $2, NOW())
+                        ON CONFLICT (user_id) DO UPDATE SET status = 'inside', last_portal_id = $2, last_event_time = NOW()`,
 						userID, portalID)
 					if err != nil {
 						fmt.Printf("Erro ao salvar entrada: %v\n", err)
 					}
-					// Desabilita o usuário para impedir novas identificações
 					go disableUserOnDevice(userID)
 					fmt.Printf("🚪 Entrada registrada para usuário %d. Usuário desabilitado até a saída.\n", userID)
 				}
 			} else if portalID == SAIDA_PORTAL {
-				// Saída: habilita novamente o usuário
 				_, err = database.DB.Exec(`UPDATE user_session SET status = 'outside', last_portal_id = $1, last_event_time = NOW() WHERE user_id = $2`,
 					portalID, userID)
 				if err != nil {
@@ -179,11 +182,10 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 	fmt.Println("Monitor/dao processado")
 }
 
-// As demais funções (handleUserIdentified, handleAccessLog, handleOperationMode) permanecem iguais ao código anterior.
-
+// handleUserIdentified só é chamado no modo Push/Enterprise (não usado no Monitor)
 func handleUserIdentified(w http.ResponseWriter, body []byte) {
-	// Mantenha igual ao seu código atual (já está correto para o caso de modo Push, mas não é usado no Monitor)
-	// ...
+	// Mantido vazio pois não é utilizado no modo Monitor atual
+	w.WriteHeader(http.StatusOK)
 }
 
 func handleAccessLog(w http.ResponseWriter, body []byte) {
