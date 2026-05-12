@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"idface-sync/config"
@@ -182,10 +184,86 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 	fmt.Println("Monitor/dao processado")
 }
 
-// handleUserIdentified só é chamado no modo Push/Enterprise (não usado no Monitor)
 func handleUserIdentified(w http.ResponseWriter, body []byte) {
-	// Mantido vazio pois não é utilizado no modo Monitor atual
-	w.WriteHeader(http.StatusOK)
+	values, err := url.ParseQuery(string(body))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	userMatricula := values.Get("registration")
+	userName := values.Get("user_name")
+
+	// 1. Buscar o cod_usuario (userID) a partir da matrícula
+	var userID int
+	err = database.DB.QueryRow(`
+        SELECT cod_usuario 
+        FROM usuarios 
+        WHERE matricula = $1
+    `, userMatricula).Scan(&userID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			fmt.Printf("❌ Matrícula %s não encontrada ou inativa no sistema.\n", userMatricula)
+		} else {
+			fmt.Printf("Erro ao buscar usuário: %v\n", err)
+		}
+		// Mesmo sem encontrar, negamos o acesso
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "denied", "reason": "Usuário não cadastrado"})
+		return
+	}
+
+	// 2. Buscar a lista de matrículas permitidas para hoje
+	rows, err := database.DB.Query(`
+        SELECT usuarios_consumo_restaurante
+        FROM itens_vendas
+        WHERE data_pedido = CURRENT_DATE
+          AND usuarios_consumo_restaurante IS NOT NULL
+          AND jsonb_array_length(usuarios_consumo_restaurante) > 0
+    `)
+	if err != nil {
+		fmt.Printf("Erro na consulta de regras: %v\n", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	allowedMatriculas := make(map[string]bool)
+
+	for rows.Next() {
+		var jsonArray string
+		if err := rows.Scan(&jsonArray); err != nil {
+			continue
+		}
+		var matriculas []string
+		if err := json.Unmarshal([]byte(jsonArray), &matriculas); err != nil {
+			continue
+		}
+		for _, m := range matriculas {
+			parts := strings.Split(m, " - ")
+			if len(parts) >= 2 {
+				mat := parts[len(parts)-1]
+				allowedMatriculas[mat] = true
+			}
+		}
+	}
+
+	// 3. Verifica se a matrícula está na lista permitida
+	if allowedMatriculas[userMatricula] {
+		fmt.Printf("✅ Acesso permitido: %s (ID %d, matrícula %s)\n", userName, userID, userMatricula)
+		// Aqui você pode usar o userID para qualquer outra ação (ex: registrar entrada, etc.)
+		resp := map[string]string{"status": "allowed"}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(resp)
+	} else {
+		fmt.Printf("❌ Acesso NEGADO: %s (ID %d, matrícula %s) - não está na lista de hoje\n", userName, userID, userMatricula)
+		resp := map[string]string{"status": "denied", "reason": "Usuário não autorizado para hoje"}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(resp)
+	}
 }
 
 func handleAccessLog(w http.ResponseWriter, body []byte) {
