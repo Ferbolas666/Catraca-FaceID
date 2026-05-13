@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"time" // <-- adicionado
 
 	"idface-sync/database"
 	"idface-sync/handlers"
@@ -33,11 +34,14 @@ func main() {
 	idface.StartFaceWorker()
 	handlers.StartWorker()
 
-	// SYNC NÃO PODE BATER EM LOGIN
+	// SYNC PERIÓDICA (a cada 30 segundos)
 	go func() {
-		err := syncer.SyncUsers(session)
-		if err != nil {
-			fmt.Println("ERRO SYNC:", err)
+		for {
+			err := syncer.SyncUsers(session)
+			if err != nil {
+				fmt.Println("ERRO SYNC:", err)
+			}
+			time.Sleep(30 * time.Second) // intervalo entre sincronizações
 		}
 	}()
 
