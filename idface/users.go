@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"idface-sync/config"
@@ -99,6 +100,7 @@ func SetUserImage(session string, userID int, imageBytes []byte) error {
 
 // AddUserToAccessRule associa um usuário a uma regra de acesso.
 // Geralmente a regra de ID 1 é a padrão que permite a passagem.
+// Se a associação já existir (UNIQUE constraint), ignora o erro.
 func AddUserToAccessRule(session string, userID int, ruleID int) error {
 	url := fmt.Sprintf("http://%s/create_objects.fcgi?session=%s", config.IDFACE_IP, session)
 
@@ -125,6 +127,11 @@ func AddUserToAccessRule(session string, userID int, ruleID int) error {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		// Se for erro de unicidade, ignore (já existe)
+		if strings.Contains(string(body), "UNIQUE constraint failed") {
+			fmt.Printf("Regra de acesso já associada ao usuário %d (ignorado)\n", userID)
+			return nil
+		}
 		return fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
 	}
 
