@@ -50,7 +50,6 @@ func SyncUsers(session string) error {
 
 	if len(allowedMatriculas) == 0 {
 		fmt.Println("Nenhum usuário autorizado hoje. Removendo todos os usuários do dispositivo.")
-		// Remove todos os usuários do dispositivo
 		return removeAllDeviceUsers(session)
 	}
 
@@ -84,6 +83,9 @@ func SyncUsers(session string) error {
 			fmt.Println("ERRO SCAN:", err)
 			continue
 		}
+		// O dispositivo já cria o usuário habilitado por padrão.
+		// Não enviar campo "enabled".
+
 		if err := idface.CreateOrModifyUser(session, user); err != nil {
 			fmt.Printf("ERRO AO ENVIAR %s: %v\n", user.Name, err)
 			continue
@@ -92,6 +94,12 @@ func SyncUsers(session string) error {
 			if err := idface.SetUserImage(session, user.ID, fotoBytes); err != nil {
 				fmt.Printf("ERRO FOTO %s: %v\n", user.Name, err)
 			}
+		}
+		// Associa o usuário à regra de acesso 1 (permissão padrão)
+		if err := idface.AddUserToAccessRule(session, user.ID, 1); err != nil {
+			fmt.Printf("ERRO REGRA DE ACESSO %s: %v\n", user.Name, err)
+		} else {
+			fmt.Printf("Regra de acesso associada para %s\n", user.Name)
 		}
 		fmt.Printf("SINCRONIZADO: %s (matrícula %s)\n", user.Name, user.Registration)
 	}

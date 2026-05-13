@@ -96,3 +96,38 @@ func SetUserImage(session string, userID int, imageBytes []byte) error {
 
 	return nil
 }
+
+// AddUserToAccessRule associa um usuário a uma regra de acesso.
+// Geralmente a regra de ID 1 é a padrão que permite a passagem.
+func AddUserToAccessRule(session string, userID int, ruleID int) error {
+	url := fmt.Sprintf("http://%s/create_objects.fcgi?session=%s", config.IDFACE_IP, session)
+
+	payload := map[string]interface{}{
+		"object": "user_access_rules",
+		"values": []map[string]interface{}{
+			{
+				"user_id":        userID,
+				"access_rule_id": ruleID,
+			},
+		},
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+	}
+
+	fmt.Printf("Regra de acesso %d associada ao usuário %d\n", ruleID, userID)
+	return nil
+}

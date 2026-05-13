@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -111,77 +110,9 @@ func Webhook(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleMonitorDAO(w http.ResponseWriter, body []byte) {
-	var data struct {
-		ObjectChanges []struct {
-			Object string `json:"object"`
-			Type   string `json:"type"`
-			Values struct {
-				UserID   string `json:"user_id"`
-				PortalID string `json:"portal_id"`
-			} `json:"values"`
-		} `json:"object_changes"`
-	}
-	if err := json.Unmarshal(body, &data); err != nil {
-		fmt.Printf("Erro ao parsear monitor/dao: %v\n", err)
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	const ENTRADA_PORTAL = 1
-	const SAIDA_PORTAL = 2
-
-	for _, change := range data.ObjectChanges {
-		if change.Object == "access_logs" && change.Type == "inserted" {
-			userID, err := strconv.Atoi(change.Values.UserID)
-			if err != nil {
-				fmt.Printf("Erro ao converter user_id '%s': %v\n", change.Values.UserID, err)
-				continue
-			}
-			portalID, err := strconv.Atoi(change.Values.PortalID)
-			if err != nil {
-				fmt.Printf("Erro ao converter portal_id '%s': %v\n", change.Values.PortalID, err)
-				continue
-			}
-
-			// Busca estado atual no banco
-			var status string
-			err = database.DB.QueryRow("SELECT status FROM user_session WHERE user_id = $1", userID).Scan(&status)
-			if err == sql.ErrNoRows {
-				status = "outside"
-			} else if err != nil {
-				fmt.Printf("Erro ao consultar status: %v\n", err)
-				continue
-			}
-
-			if portalID == ENTRADA_PORTAL {
-				if status == "inside" {
-					fmt.Printf("⚠️ Usuário %d tentou entrar novamente. Desabilitando no dispositivo.\n", userID)
-					go disableUserOnDevice(userID)
-				} else {
-					_, err = database.DB.Exec(`INSERT INTO user_session (user_id, status, last_portal_id, last_event_time)
-                        VALUES ($1, 'inside', $2, NOW())
-                        ON CONFLICT (user_id) DO UPDATE SET status = 'inside', last_portal_id = $2, last_event_time = NOW()`,
-						userID, portalID)
-					if err != nil {
-						fmt.Printf("Erro ao salvar entrada: %v\n", err)
-					}
-					go disableUserOnDevice(userID)
-					fmt.Printf("🚪 Entrada registrada para usuário %d. Usuário desabilitado até a saída.\n", userID)
-				}
-			} else if portalID == SAIDA_PORTAL {
-				_, err = database.DB.Exec(`UPDATE user_session SET status = 'outside', last_portal_id = $1, last_event_time = NOW() WHERE user_id = $2`,
-					portalID, userID)
-				if err != nil {
-					fmt.Printf("Erro ao atualizar saída: %v\n", err)
-				}
-				go enableUserOnDevice(userID)
-				fmt.Printf("🚪 Saída registrada para usuário %d. Usuário reabilitado.\n", userID)
-			}
-		}
-	}
-
+	// Apenas registra o log, sem modificar estado do usuário
+	fmt.Println("Monitor/dao recebido (log de acesso)")
 	w.WriteHeader(http.StatusNoContent)
-	fmt.Println("Monitor/dao processado")
 }
 
 func handleUserIdentified(w http.ResponseWriter, body []byte) {
@@ -207,7 +138,6 @@ func handleUserIdentified(w http.ResponseWriter, body []byte) {
 		} else {
 			fmt.Printf("Erro ao buscar usuário: %v\n", err)
 		}
-		// Mesmo sem encontrar, negamos o acesso
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "denied", "reason": "Usuário não cadastrado"})
@@ -243,7 +173,7 @@ func handleUserIdentified(w http.ResponseWriter, body []byte) {
 		for _, m := range matriculas {
 			parts := strings.Split(m, " - ")
 			if len(parts) >= 2 {
-				mat := parts[len(parts)-1]
+				mat := strings.TrimSpace(parts[len(parts)-1])
 				allowedMatriculas[mat] = true
 			}
 		}
@@ -252,8 +182,7 @@ func handleUserIdentified(w http.ResponseWriter, body []byte) {
 	// 3. Verifica se a matrícula está na lista permitida
 	if allowedMatriculas[userMatricula] {
 		fmt.Printf("✅ Acesso permitido: %s (ID %d, matrícula %s)\n", userName, userID, userMatricula)
-		// Aqui você pode usar o userID para qualquer outra ação (ex: registrar entrada, etc.)
-		resp := map[string]string{"status": "allowed"}
+		resp := map[string]string{"status": "allowed", "result": "success", "action": "open"}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(resp)
