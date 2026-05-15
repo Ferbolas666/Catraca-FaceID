@@ -15,6 +15,7 @@ import (
 	"idface-sync/config"
 	"idface-sync/database"
 	"idface-sync/idface"
+	"idface-sync/models"
 )
 
 var eventQueue = make(chan int, 1000)
@@ -33,16 +34,13 @@ func StartWorker() {
 	}()
 }
 
-// Desabilita um usuário no dispositivo (impede reconhecimento)
-func disableUserOnDevice(userID int) error {
-	url := fmt.Sprintf("http://%s/update_objects.fcgi?session=%s", config.IDFACE_IP, session)
+// deleteUserFromDevice remove completamente o usuário do dispositivo
+func deleteUserFromDevice(userID int) error {
+	url := fmt.Sprintf("http://%s/destroy_objects.fcgi?session=%s", config.IDFACE_IP, session)
 	payload := map[string]interface{}{
 		"object": "users",
 		"values": []map[string]interface{}{
-			{
-				"id":      userID,
-				"enabled": "0",
-			},
+			{"id": userID},
 		},
 	}
 	jsonData, _ := json.Marshal(payload)
@@ -52,34 +50,39 @@ func disableUserOnDevice(userID int) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("falha ao desabilitar usuário: %d", resp.StatusCode)
+		return fmt.Errorf("falha ao remover usuário %d: status %d", userID, resp.StatusCode)
 	}
-	fmt.Printf("Usuário %d desabilitado no dispositivo\n", userID)
+	fmt.Printf("🗑️ Usuário %d removido do dispositivo\n", userID)
 	return nil
 }
 
-// Habilita um usuário no dispositivo
-func enableUserOnDevice(userID int) error {
-	url := fmt.Sprintf("http://%s/update_objects.fcgi?session=%s", config.IDFACE_IP, session)
-	payload := map[string]interface{}{
-		"object": "users",
-		"values": []map[string]interface{}{
-			{
-				"id":      userID,
-				"enabled": "1",
-			},
-		},
-	}
-	jsonData, _ := json.Marshal(payload)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+// recreateUser recria o usuário no dispositivo (usado apenas se necessário)
+func recreateUser(userID int) error {
+	var user models.User
+	var fotoBytes []byte
+	err := database.DB.QueryRow(`
+		SELECT cod_usuario, nome, matricula, foto
+		FROM usuarios
+		WHERE cod_usuario = $1
+	`, userID).Scan(&user.ID, &user.Name, &user.Registration, &fotoBytes)
 	if err != nil {
-		return err
+		return fmt.Errorf("erro ao buscar dados do usuário %d: %v", userID, err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("falha ao habilitar usuário: %d", resp.StatusCode)
+
+	if err := idface.CreateOrModifyUser(session, user); err != nil {
+		return fmt.Errorf("erro ao recriar usuário %d: %v", userID, err)
 	}
-	fmt.Printf("Usuário %d habilitado no dispositivo\n", userID)
+	if len(fotoBytes) > 0 {
+		if err := idface.SetUserImage(session, user.ID, fotoBytes); err != nil {
+			fmt.Printf("⚠️ Erro ao reenviar foto do usuário %d: %v\n", userID, err)
+		}
+	}
+	if err := idface.AddUserToAccessRule(session, user.ID, 1); err != nil {
+		if !strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			fmt.Printf("⚠️ Erro ao reassociar regra de acesso: %v\n", err)
+		}
+	}
+	fmt.Printf("♻️ Usuário %d recriado no dispositivo\n", userID)
 	return nil
 }
 
@@ -119,7 +122,6 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 				UserID     string `json:"user_id"`
 				PortalID   string `json:"portal_id"`
 				Confidence string `json:"confidence"`
-				Time       string `json:"time"`
 			} `json:"values"`
 		} `json:"object_changes"`
 	}
@@ -136,7 +138,6 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 			portalID, _ := strconv.Atoi(change.Values.PortalID)
 			confidence, _ := strconv.Atoi(change.Values.Confidence)
 
-			// Determina o tipo de evento
 			eventType := "unknown"
 			if portalID == 1 {
 				eventType = "entry"
@@ -144,40 +145,91 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 				eventType = "exit"
 			}
 
-			// 1. Insere na tabela access_logs
+			// Insere log
 			_, err := database.DB.Exec(`
-                INSERT INTO access_log (user_id, portal_id, event_time, confidence, event_type)
-                VALUES ($1, $2, NOW(), $3, $4)
-            `, userID, portalID, confidence, eventType)
+				INSERT INTO access_log (user_id, portal_id, event_time, confidence, event_type)
+				VALUES ($1, $2, NOW(), $3, $4)
+			`, userID, portalID, confidence, eventType)
 			if err != nil {
 				fmt.Printf("Erro ao inserir access_log: %v\n", err)
 			}
 
-			// 2. Atualiza o status na tabela user_session
-			if portalID == 1 { // entrada
-				_, err = database.DB.Exec(`
-                    INSERT INTO user_session (user_id, status, last_event_time, last_portal_id)
-                    VALUES ($1, 'inside', NOW(), $2)
-                    ON CONFLICT (user_id) DO UPDATE SET
-                        status = 'inside',
-                        last_event_time = NOW(),
-                        last_portal_id = $2
-                `, userID, portalID)
-			} else if portalID == 2 { // saída
-				_, err = database.DB.Exec(`
-                    INSERT INTO user_session (user_id, status, last_event_time, last_portal_id)
-                    VALUES ($1, 'outside', NOW(), $2)
-                    ON CONFLICT (user_id) DO UPDATE SET
-                        status = 'outside',
-                        last_event_time = NOW(),
-                        last_portal_id = $2
-                `, userID, portalID)
-			}
-			if err != nil {
-				fmt.Printf("Erro ao atualizar user_session: %v\n", err)
+			// Busca status atual
+			var currentStatus string
+			err = database.DB.QueryRow("SELECT status FROM user_session WHERE user_id = $1", userID).Scan(&currentStatus)
+			if err == sql.ErrNoRows {
+				currentStatus = "outside"
+			} else if err != nil {
+				fmt.Printf("Erro ao consultar status: %v\n", err)
+				continue
 			}
 
-			fmt.Printf("Log registrado: user %d, portal %d (%s), confiança %d\n", userID, portalID, eventType, confidence)
+			if portalID == 1 { // ENTRADA
+				if currentStatus == "outside" {
+					// Verifica se ainda existe consumo não usado para hoje
+					var hasUnused bool
+					err = database.DB.QueryRow(`
+						SELECT EXISTS(
+							SELECT 1 FROM consumo_controle
+							WHERE user_id = $1 AND data_pedido = CURRENT_DATE AND entrada_ocorrida = FALSE
+						)
+					`, userID).Scan(&hasUnused)
+					if err != nil {
+						fmt.Printf("Erro ao verificar consumo: %v\n", err)
+						continue
+					}
+					if !hasUnused {
+						fmt.Printf("⛔ Entrada bloqueada: user %d não possui consumo válido para hoje\n", userID)
+						continue
+					}
+
+					// Atualiza status no banco para inside
+					_, err = database.DB.Exec(`
+						INSERT INTO user_session (user_id, status, last_event_time, last_portal_id)
+						VALUES ($1, 'inside', NOW(), $2)
+						ON CONFLICT (user_id) DO UPDATE SET
+							status = 'inside',
+							last_event_time = NOW(),
+							last_portal_id = $2
+					`, userID, portalID)
+					if err != nil {
+						fmt.Printf("Erro ao atualizar status (entrada): %v\n", err)
+					} else {
+						fmt.Printf("✅ Entrada registrada: user %d\n", userID)
+
+						// MARCA entrada_ocorrida = TRUE
+						res, err := database.DB.Exec(`
+							UPDATE consumo_controle
+							SET entrada_ocorrida = TRUE
+							WHERE user_id = $1 AND data_pedido = CURRENT_DATE AND entrada_ocorrida = FALSE
+						`, userID)
+						if err != nil {
+							fmt.Printf("Erro ao marcar entrada_ocorrida: %v\n", err)
+						} else {
+							rowsAffected, _ := res.RowsAffected()
+							fmt.Printf("✅ entrada_ocorrida atualizado para user %d. Linhas afetadas: %d\n", userID, rowsAffected)
+						}
+					}
+				} else {
+					fmt.Printf("⛔ Tentativa de entrada bloqueada: user %d já está inside\n", userID)
+				}
+			} else if portalID == 2 { // SAÍDA
+				if currentStatus == "inside" {
+					// Atualiza status no banco para outside
+					_, err = database.DB.Exec(`
+						UPDATE user_session SET status = 'outside', last_event_time = NOW(), last_portal_id = $1
+						WHERE user_id = $2
+					`, portalID, userID)
+					if err != nil {
+						fmt.Printf("Erro ao atualizar status (saída): %v\n", err)
+					} else {
+						fmt.Printf("🚪 Saída registrada: user %d. Removendo usuário do dispositivo.\n", userID)
+						go deleteUserFromDevice(userID)
+					}
+				} else {
+					fmt.Printf("⚠️ Saída ignorada: user %d já estava fora\n", userID)
+				}
+			}
 		}
 	}
 
@@ -185,27 +237,22 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 	fmt.Println("Monitor/dao processado")
 }
 
+// handleUserIdentified (mantido, mas não usado no modo Monitor)
 func handleUserIdentified(w http.ResponseWriter, body []byte) {
 	values, err := url.ParseQuery(string(body))
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-
 	userMatricula := values.Get("registration")
 	userName := values.Get("user_name")
 	portalID, _ := strconv.Atoi(values.Get("portal_id"))
 
-	// 1. Buscar o cod_usuario (userID) a partir da matrícula
 	var userID int
-	err = database.DB.QueryRow(`
-        SELECT cod_usuario 
-        FROM usuarios 
-        WHERE matricula = $1
-    `, userMatricula).Scan(&userID)
+	err = database.DB.QueryRow(`SELECT cod_usuario FROM usuarios WHERE matricula = $1`, userMatricula).Scan(&userID)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			fmt.Printf("❌ Matrícula %s não encontrada no sistema.\n", userMatricula)
+			fmt.Printf("❌ Matrícula %s não encontrada.\n", userMatricula)
 		} else {
 			fmt.Printf("Erro ao buscar usuário: %v\n", err)
 		}
@@ -215,113 +262,82 @@ func handleUserIdentified(w http.ResponseWriter, body []byte) {
 		return
 	}
 
-	// 2. Buscar a lista de matrículas permitidas para hoje (consumo)
-	rows, err := database.DB.Query(`
-        SELECT usuarios_consumo_restaurante
-        FROM itens_vendas
-        WHERE data_pedido = CURRENT_DATE
-          AND usuarios_consumo_restaurante IS NOT NULL
-          AND jsonb_array_length(usuarios_consumo_restaurante) > 0
-    `)
+	// Verifica se existe consumo não utilizado para hoje
+	var hasUnused bool
+	err = database.DB.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM consumo_controle
+			WHERE user_id = $1 AND data_pedido = CURRENT_DATE AND entrada_ocorrida = FALSE
+		)
+	`, userID).Scan(&hasUnused)
 	if err != nil {
-		fmt.Printf("Erro na consulta de regras: %v\n", err)
+		fmt.Printf("Erro ao verificar consumo: %v\n", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
-
-	allowedMatriculas := make(map[string]bool)
-	for rows.Next() {
-		var jsonArray string
-		if err := rows.Scan(&jsonArray); err != nil {
-			continue
-		}
-		var matriculas []string
-		if err := json.Unmarshal([]byte(jsonArray), &matriculas); err != nil {
-			continue
-		}
-		for _, m := range matriculas {
-			parts := strings.Split(m, " - ")
-			if len(parts) >= 2 {
-				mat := strings.TrimSpace(parts[len(parts)-1])
-				allowedMatriculas[mat] = true
-			}
-		}
-	}
-
-	// 3. Verificar se a matrícula está autorizada para hoje (regra de consumo)
-	if !allowedMatriculas[userMatricula] {
-		fmt.Printf("❌ Acesso NEGADO (consumo): %s (ID %d, matrícula %s) - não está na lista de hoje\n", userName, userID, userMatricula)
+	if !hasUnused {
+		fmt.Printf("❌ Acesso NEGADO: %s (ID %d) não possui consumo válido para hoje\n", userName, userID)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "denied", "reason": "Usuário não autorizado para hoje"})
+		json.NewEncoder(w).Encode(map[string]string{"status": "denied", "reason": "Não autorizado hoje"})
 		return
 	}
 
-	// 4. Consultar status atual na tabela user_session
 	var status string
 	err = database.DB.QueryRow("SELECT status FROM user_session WHERE user_id = $1", userID).Scan(&status)
 	if err == sql.ErrNoRows {
-		status = "outside" // usuário nunca entrou, considera fora
+		status = "outside"
 	} else if err != nil {
 		fmt.Printf("Erro ao consultar status: %v\n", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	const ENTRADA = 1
-	const SAIDA = 2
-
 	allowed := false
 	newStatus := status
-
-	if portalID == ENTRADA {
-		if status == "outside" {
-			allowed = true
-			newStatus = "inside"
-			fmt.Printf("✅ Entrada permitida: %s (ID %d)\n", userName, userID)
-		} else {
-			fmt.Printf("🚫 Entrada NEGADA (já dentro): %s (ID %d)\n", userName, userID)
-		}
-	} else if portalID == SAIDA {
-		// Saída sempre permitida, mas só atualiza se estava dentro
+	if portalID == 1 && status == "outside" {
+		allowed = true
+		newStatus = "inside"
+		fmt.Printf("✅ Entrada permitida: %s (ID %d)\n", userName, userID)
+	} else if portalID == 2 {
 		allowed = true
 		if status == "inside" {
 			newStatus = "outside"
 			fmt.Printf("🚪 Saída registrada: %s (ID %d)\n", userName, userID)
 		} else {
-			fmt.Printf("⚠️ Saída ignorada (já estava fora): %s (ID %d)\n", userName, userID)
+			fmt.Printf("⚠️ Saída ignorada (já fora): %s\n", userName)
 		}
 	} else {
-		// Outros portais? Decide-se permitir
 		allowed = true
-		fmt.Printf("Portal %d não mapeado, permitindo acesso para %s\n", portalID, userName)
 	}
 
-	// 5. Se permitido, atualiza o status no banco e responde allowed
 	if allowed {
 		if newStatus != status {
 			_, err = database.DB.Exec(`
-                INSERT INTO user_session (user_id, status, last_portal_id, last_event_time)
-                VALUES ($1, $2, $3, NOW())
-                ON CONFLICT (user_id) DO UPDATE SET
-                    status = $2,
-                    last_portal_id = $3,
-                    last_event_time = NOW()
-            `, userID, newStatus, portalID)
+				INSERT INTO user_session (user_id, status, last_portal_id, last_event_time)
+				VALUES ($1, $2, $3, NOW())
+				ON CONFLICT (user_id) DO UPDATE SET status=$2, last_portal_id=$3, last_event_time=NOW()
+			`, userID, newStatus, portalID)
 			if err != nil {
 				fmt.Printf("Erro ao atualizar status: %v\n", err)
 			}
+			// Se for entrada, marca consumo utilizado
+			if portalID == 1 {
+				_, err = database.DB.Exec(`
+					UPDATE consumo_controle
+					SET entrada_ocorrida = TRUE
+					WHERE user_id = $1 AND data_pedido = CURRENT_DATE AND entrada_ocorrida = FALSE
+				`, userID)
+				if err != nil {
+					fmt.Printf("Erro ao marcar consumo utilizado: %v\n", err)
+				}
+			}
 		}
-		resp := map[string]string{"status": "allowed"}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(resp)
+		json.NewEncoder(w).Encode(map[string]string{"status": "allowed"})
 	} else {
-		resp := map[string]string{"status": "denied", "reason": "Usuário já está dentro"}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(resp)
+		json.NewEncoder(w).Encode(map[string]string{"status": "denied", "reason": "Usuário já está dentro"})
 	}
 }
 

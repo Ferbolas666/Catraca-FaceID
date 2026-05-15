@@ -13,39 +13,20 @@ import (
 	"idface-sync/models"
 )
 
-// SyncUsers sincroniza com o dispositivo: envia apenas os usuários autorizados para hoje
-// e remove todos os demais que existem no dispositivo.
+// SyncUsers sincroniza com o dispositivo:
+// - Atualiza a tabela consumo_controle com os usuários dos pedidos de hoje (entrada_ocorrida = FALSE)
+// - Envia para o dispositivo apenas os usuários que ainda não entraram (entrada_ocorrida = FALSE)
+// - Remove do dispositivo usuários que não estão em nenhum pedido de hoje
 func SyncUsers(session string) error {
-	// 1. Obter matrículas autorizadas para hoje (baseado em itens_vendas)
-	rowsPerm, err := database.DB.Query(`
-		SELECT usuarios_consumo_restaurante
-		FROM itens_vendas
-		WHERE data_pedido = CURRENT_DATE
-		  AND usuarios_consumo_restaurante IS NOT NULL
-		  AND jsonb_array_length(usuarios_consumo_restaurante) > 0
-	`)
-	if err != nil {
-		return fmt.Errorf("erro ao consultar permissões: %v", err)
+	// 1. Atualizar a tabela consumo_controle a partir dos pedidos de hoje
+	if err := refreshConsumoControle(); err != nil {
+		fmt.Printf("Erro ao atualizar consumo_controle: %v\n", err)
 	}
-	defer rowsPerm.Close()
 
-	allowedMatriculas := make(map[string]bool)
-	for rowsPerm.Next() {
-		var jsonArray string
-		if err := rowsPerm.Scan(&jsonArray); err != nil {
-			continue
-		}
-		var matriculas []string
-		if err := json.Unmarshal([]byte(jsonArray), &matriculas); err != nil {
-			continue
-		}
-		for _, m := range matriculas {
-			parts := strings.Split(m, " - ")
-			if len(parts) >= 2 {
-				mat := strings.TrimSpace(parts[len(parts)-1])
-				allowedMatriculas[mat] = true
-			}
-		}
+	// 2. Obter lista de matrículas autorizadas (todas que aparecem em consumo_controle hoje)
+	allowedMatriculas, err := getAllowedMatriculasFromControle()
+	if err != nil {
+		return fmt.Errorf("erro ao obter autorizados: %v", err)
 	}
 
 	if len(allowedMatriculas) == 0 {
@@ -53,26 +34,16 @@ func SyncUsers(session string) error {
 		return removeAllDeviceUsers(session)
 	}
 
-	// 2. Enviar usuários autorizados (cria/atualiza)
-	matriculasList := make([]string, 0, len(allowedMatriculas))
-	for mat := range allowedMatriculas {
-		matriculasList = append(matriculasList, mat)
-	}
-
-	query := fmt.Sprintf(`
-		SELECT cod_usuario, nome, matricula, foto
-		FROM usuarios
-		WHERE ativo = 'S' AND matricula IN (%s)
-	`, formatPlaceholders(len(matriculasList)))
-
-	args := make([]interface{}, len(matriculasList))
-	for i, mat := range matriculasList {
-		args[i] = mat
-	}
-
-	rows, err := database.DB.Query(query, args...)
+	// 3. Buscar usuários que ainda NÃO entraram hoje (entrada_ocorrida = FALSE)
+	rows, err := database.DB.Query(`
+		SELECT u.cod_usuario, u.nome, u.matricula, u.foto
+		FROM usuarios u
+		JOIN consumo_controle cc ON cc.user_id = u.cod_usuario
+		WHERE cc.data_pedido = CURRENT_DATE
+		  AND cc.entrada_ocorrida = FALSE
+	`)
 	if err != nil {
-		return fmt.Errorf("erro ao buscar usuários: %v", err)
+		return fmt.Errorf("erro ao buscar usuários não autorizados: %v", err)
 	}
 	defer rows.Close()
 
@@ -83,9 +54,8 @@ func SyncUsers(session string) error {
 			fmt.Println("ERRO SCAN:", err)
 			continue
 		}
-		// O dispositivo já cria o usuário habilitado por padrão.
-		// Não enviar campo "enabled".
 
+		// Envia usuário
 		if err := idface.CreateOrModifyUser(session, user); err != nil {
 			fmt.Printf("ERRO AO ENVIAR %s: %v\n", user.Name, err)
 			continue
@@ -95,7 +65,7 @@ func SyncUsers(session string) error {
 				fmt.Printf("ERRO FOTO %s: %v\n", user.Name, err)
 			}
 		}
-		// Associa o usuário à regra de acesso 1 (permissão padrão)
+		// Associa regra de acesso
 		if err := idface.AddUserToAccessRule(session, user.ID, 1); err != nil {
 			fmt.Printf("ERRO REGRA DE ACESSO %s: %v\n", user.Name, err)
 		} else {
@@ -104,12 +74,86 @@ func SyncUsers(session string) error {
 		fmt.Printf("SINCRONIZADO: %s (matrícula %s)\n", user.Name, user.Registration)
 	}
 
-	// 3. Remover usuários do dispositivo que não estão na lista autorizada
+	// 4. Remover do dispositivo usuários que NÃO estão em nenhum pedido de hoje
 	if err := removeUnauthorizedUsers(session, allowedMatriculas); err != nil {
 		fmt.Printf("Erro ao remover usuários não autorizados: %v\n", err)
 	}
 
 	return nil
+}
+
+// refreshConsumoControle insere registros em consumo_controle para cada (item_venda, usuário) dos pedidos de hoje.
+func refreshConsumoControle() error {
+	rows, err := database.DB.Query(`
+		SELECT cod_itens_venda, usuarios_consumo_restaurante
+		FROM itens_vendas
+		WHERE data_pedido = CURRENT_DATE
+		  AND usuarios_consumo_restaurante IS NOT NULL
+		  AND jsonb_array_length(usuarios_consumo_restaurante) > 0
+	`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var itemVendaID int
+		var jsonArray string
+		if err := rows.Scan(&itemVendaID, &jsonArray); err != nil {
+			continue
+		}
+		var matriculas []string
+		if err := json.Unmarshal([]byte(jsonArray), &matriculas); err != nil {
+			continue
+		}
+		for _, m := range matriculas {
+			parts := strings.Split(m, " - ")
+			if len(parts) < 2 {
+				continue
+			}
+			matricula := strings.TrimSpace(parts[len(parts)-1])
+			var userID int
+			err = database.DB.QueryRow(`SELECT cod_usuario FROM usuarios WHERE matricula = $1`, matricula).Scan(&userID)
+			if err != nil {
+				fmt.Printf("Matrícula %s não encontrada: %v\n", matricula, err)
+				continue
+			}
+			// Insere apenas se não existir; entrada_ocorrida inicia como FALSE
+			_, err = database.DB.Exec(`
+				INSERT INTO consumo_controle (item_venda_id, user_id, data_pedido, entrada_ocorrida)
+				VALUES ($1, $2, CURRENT_DATE, FALSE)
+				ON CONFLICT (item_venda_id, user_id) DO NOTHING
+			`, itemVendaID, userID)
+			if err != nil {
+				fmt.Printf("Erro ao inserir consumo_controle: %v\n", err)
+			}
+		}
+	}
+	return nil
+}
+
+// getAllowedMatriculasFromControle retorna todas as matrículas que aparecem em consumo_controle para hoje
+func getAllowedMatriculasFromControle() (map[string]bool, error) {
+	rows, err := database.DB.Query(`
+		SELECT u.matricula
+		FROM consumo_controle cc
+		JOIN usuarios u ON u.cod_usuario = cc.user_id
+		WHERE cc.data_pedido = CURRENT_DATE
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	allowed := make(map[string]bool)
+	for rows.Next() {
+		var matricula string
+		if err := rows.Scan(&matricula); err != nil {
+			continue
+		}
+		allowed[matricula] = true
+	}
+	return allowed, nil
 }
 
 // removeUnauthorizedUsers busca todos os usuários do dispositivo e remove aqueles cuja matrícula não está em allowedMatriculas.
@@ -201,16 +245,4 @@ func deleteUserFromDevice(session string, userID int) error {
 		return fmt.Errorf("status %d ao remover usuário %d", resp.StatusCode, userID)
 	}
 	return nil
-}
-
-// formatPlaceholders gera placeholders $1, $2...
-func formatPlaceholders(n int) string {
-	if n == 0 {
-		return ""
-	}
-	placeholders := make([]string, n)
-	for i := 0; i < n; i++ {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
-	}
-	return strings.Join(placeholders, ", ")
 }
