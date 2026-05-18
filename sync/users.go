@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"idface-sync/config"
 	"idface-sync/database"
@@ -15,7 +16,7 @@ import (
 
 // SyncUsers sincroniza com o dispositivo:
 // - Atualiza a tabela consumo_controle com os usuários dos pedidos de hoje (entrada_ocorrida = FALSE)
-// - Envia para o dispositivo apenas os usuários que ainda não entraram (entrada_ocorrida = FALSE)
+// - Envia para o dispositivo apenas os usuários que ainda não entraram e que estão dentro do horário permitido
 // - Remove do dispositivo usuários que não estão em nenhum pedido de hoje
 func SyncUsers(session string) error {
 	// 1. Atualizar a tabela consumo_controle a partir dos pedidos de hoje
@@ -34,26 +35,31 @@ func SyncUsers(session string) error {
 		return removeAllDeviceUsers(session)
 	}
 
-	// 3. Buscar usuários que ainda NÃO entraram hoje (entrada_ocorrida = FALSE)
+	// 3. Buscar usuários que ainda NÃO entraram hoje e que estão dentro do horário atual
 	rows, err := database.DB.Query(`
-		SELECT u.cod_usuario, u.nome, u.matricula, u.foto
+		SELECT u.cod_usuario, u.nome, u.matricula, u.foto,
+		       cc.hora_inicio, cc.hora_fim
 		FROM usuarios u
 		JOIN consumo_controle cc ON cc.user_id = u.cod_usuario
 		WHERE cc.data_pedido = CURRENT_DATE
 		  AND cc.entrada_ocorrida = FALSE
+		  AND CURRENT_TIME BETWEEN cc.hora_inicio AND cc.hora_fim
 	`)
 	if err != nil {
 		return fmt.Errorf("erro ao buscar usuários não autorizados: %v", err)
 	}
 	defer rows.Close()
 
+	enviados := 0
 	for rows.Next() {
 		var user models.User
 		var fotoBytes []byte
-		if err := rows.Scan(&user.ID, &user.Name, &user.Registration, &fotoBytes); err != nil {
+		var horaInicio, horaFim string
+		if err := rows.Scan(&user.ID, &user.Name, &user.Registration, &fotoBytes, &horaInicio, &horaFim); err != nil {
 			fmt.Println("ERRO SCAN:", err)
 			continue
 		}
+		fmt.Printf("HORÁRIO PERMITIDO para %s: %s - %s (agora: %s)\n", user.Name, horaInicio, horaFim, time.Now().Format("15:04:05"))
 
 		// Envia usuário
 		if err := idface.CreateOrModifyUser(session, user); err != nil {
@@ -72,7 +78,9 @@ func SyncUsers(session string) error {
 			fmt.Printf("Regra de acesso associada para %s\n", user.Name)
 		}
 		fmt.Printf("SINCRONIZADO: %s (matrícula %s)\n", user.Name, user.Registration)
+		enviados++
 	}
+	fmt.Printf("Total de usuários enviados nesta rodada: %d\n", enviados)
 
 	// 4. Remover do dispositivo usuários que NÃO estão em nenhum pedido de hoje
 	if err := removeUnauthorizedUsers(session, allowedMatriculas); err != nil {
@@ -82,10 +90,11 @@ func SyncUsers(session string) error {
 	return nil
 }
 
-// refreshConsumoControle insere registros em consumo_controle para cada (item_venda, usuário) dos pedidos de hoje.
+// refreshConsumoControle insere registros em consumo_controle para cada (item_venda, usuário) dos pedidos de hoje,
+// com horários baseados no grupo do produto.
 func refreshConsumoControle() error {
 	rows, err := database.DB.Query(`
-		SELECT cod_itens_venda, usuarios_consumo_restaurante
+		SELECT cod_itens_venda, cod_produto, usuarios_consumo_restaurante
 		FROM itens_vendas
 		WHERE data_pedido = CURRENT_DATE
 		  AND usuarios_consumo_restaurante IS NOT NULL
@@ -98,10 +107,37 @@ func refreshConsumoControle() error {
 
 	for rows.Next() {
 		var itemVendaID int
+		var codProduto int
 		var jsonArray string
-		if err := rows.Scan(&itemVendaID, &jsonArray); err != nil {
+		if err := rows.Scan(&itemVendaID, &codProduto, &jsonArray); err != nil {
 			continue
 		}
+
+		// Buscar o cod_grupo do produto na tabela produtos
+		var codGrupo int
+		err = database.DB.QueryRow(`SELECT cod_grupo FROM produtos WHERE cod_produto = $1`, codProduto).Scan(&codGrupo)
+		if err != nil {
+			fmt.Printf("Erro ao buscar grupo do produto %d: %v\n", codProduto, err)
+			continue
+		}
+
+		// Definir horários conforme o grupo
+		var horaInicio, horaFim string
+		switch codGrupo {
+		case 1: // Café da manhã
+			horaInicio = "06:00:00"
+			horaFim = "08:00:00"
+		case 2: // Almoço
+			horaInicio = "10:30:00"
+			horaFim = "14:00:00"
+		case 3: // Jantar
+			horaInicio = "17:00:00"
+			horaFim = "21:00:00"
+		default:
+			fmt.Printf("Grupo %d não mapeado para o produto %d, ignorando\n", codGrupo, codProduto)
+			continue
+		}
+
 		var matriculas []string
 		if err := json.Unmarshal([]byte(jsonArray), &matriculas); err != nil {
 			continue
@@ -118,12 +154,12 @@ func refreshConsumoControle() error {
 				fmt.Printf("Matrícula %s não encontrada: %v\n", matricula, err)
 				continue
 			}
-			// Insere apenas se não existir; entrada_ocorrida inicia como FALSE
+			// Insere registro com os horários específicos do grupo
 			_, err = database.DB.Exec(`
-				INSERT INTO consumo_controle (item_venda_id, user_id, data_pedido, entrada_ocorrida)
-				VALUES ($1, $2, CURRENT_DATE, FALSE)
+				INSERT INTO consumo_controle (item_venda_id, user_id, data_pedido, entrada_ocorrida, hora_inicio, hora_fim)
+				VALUES ($1, $2, CURRENT_DATE, FALSE, $3, $4)
 				ON CONFLICT (item_venda_id, user_id) DO NOTHING
-			`, itemVendaID, userID)
+			`, itemVendaID, userID, horaInicio, horaFim)
 			if err != nil {
 				fmt.Printf("Erro ao inserir consumo_controle: %v\n", err)
 			}
