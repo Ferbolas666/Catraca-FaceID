@@ -194,20 +194,67 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 					`, userID, portalID)
 					if err != nil {
 						fmt.Printf("Erro ao atualizar status (entrada): %v\n", err)
-					} else {
-						fmt.Printf("✅ Entrada registrada: user %d\n", userID)
+						continue
+					}
+					fmt.Printf("✅ Entrada registrada: user %d\n", userID)
 
-						// MARCA entrada_ocorrida = TRUE
-						res, err := database.DB.Exec(`
-							UPDATE consumo_controle
-							SET entrada_ocorrida = TRUE
-							WHERE user_id = $1 AND data_pedido = CURRENT_DATE AND entrada_ocorrida = FALSE
-						`, userID)
+					// Marca consumo utilizado
+					_, err = database.DB.Exec(`
+						UPDATE consumo_controle
+						SET entrada_ocorrida = TRUE
+						WHERE user_id = $1 AND data_pedido = CURRENT_DATE AND entrada_ocorrida = FALSE
+					`, userID)
+					if err != nil {
+						fmt.Printf("Erro ao marcar entrada_ocorrida: %v\n", err)
+					} else {
+						fmt.Printf("✅ entrada_ocorrida atualizado para user %d\n", userID)
+					}
+
+					// 🔥 BUSCA O COD_CLIENTE ASSOCIADO AO USUÁRIO
+					var codCliente int
+					err = database.DB.QueryRow(`SELECT cod_cliente FROM usuarios WHERE cod_usuario = $1`, userID).Scan(&codCliente)
+					if err != nil {
+						fmt.Printf("⚠️ Erro ao buscar cod_cliente para user %d: %v\n", userID, err)
+					} else {
+						fmt.Printf("🔍 Usuário %d → cliente %d\n", userID, codCliente)
+
+						// 🔍 Conta quantos itens pendentes existem para este cliente hoje
+						var count int
+						countQuery := `
+        SELECT COUNT(*)
+        FROM itens_vendas iv
+        JOIN vendas v ON v.cod_venda = iv.cod_venda
+        WHERE iv.data_pedido = CURRENT_DATE
+          AND iv.status != 3
+          AND v.cod_cliente = $1
+    `
+						err = database.DB.QueryRow(countQuery, codCliente).Scan(&count)
 						if err != nil {
-							fmt.Printf("Erro ao marcar entrada_ocorrida: %v\n", err)
+							fmt.Printf("⚠️ Erro ao contar itens pendentes: %v\n", err)
 						} else {
-							rowsAffected, _ := res.RowsAffected()
-							fmt.Printf("✅ entrada_ocorrida atualizado para user %d. Linhas afetadas: %d\n", userID, rowsAffected)
+							fmt.Printf("🔍 Itens pendentes para cliente %d hoje: %d\n", codCliente, count)
+						}
+
+						// 🔥 ATUALIZA STATUS DO ITEM DE VENDA PARA 3 (consumido) – usando JOIN com vendas
+						updateQuery := `
+        UPDATE itens_vendas iv
+        SET status = 3
+        FROM vendas v
+        WHERE iv.cod_venda = v.cod_venda
+          AND iv.data_pedido = CURRENT_DATE
+          AND iv.status != 3
+          AND v.cod_cliente = $1
+    `
+						result, err := database.DB.Exec(updateQuery, codCliente)
+						if err != nil {
+							fmt.Printf("⚠️ Erro ao atualizar status do item de venda: %v\n", err)
+						} else {
+							rowsAffected, _ := result.RowsAffected()
+							if rowsAffected == 0 {
+								fmt.Printf("⚠️ Nenhum item de venda atualizado para cliente %d (nenhum pendente ou já consumido)\n", codCliente)
+							} else {
+								fmt.Printf("✅ Status do item de venda atualizado para 3 (consumido) para cliente %d. Linhas afetadas: %d\n", codCliente, rowsAffected)
+							}
 						}
 					}
 				} else {
@@ -223,7 +270,8 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 					if err != nil {
 						fmt.Printf("Erro ao atualizar status (saída): %v\n", err)
 					} else {
-						fmt.Printf("🚪 Saída registrada: user %d. Removendo usuário do dispositivo.\n", userID)
+						fmt.Printf("🚪 Saída registrada: user %d.\n", userID)
+						// Remove usuário do dispositivo
 						go deleteUserFromDevice(userID)
 					}
 				} else {
