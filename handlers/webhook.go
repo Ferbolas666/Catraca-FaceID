@@ -145,28 +145,23 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 				eventType = "exit"
 			}
 
-			// Insere log
-			_, err := database.DB.Exec(`
-				INSERT INTO access_log (user_id, portal_id, event_time, confidence, event_type)
-				VALUES ($1, $2, NOW(), $3, $4)
-			`, userID, portalID, confidence, eventType)
-			if err != nil {
-				fmt.Printf("Erro ao inserir access_log: %v\n", err)
-			}
-
 			// Busca status atual
 			var currentStatus string
-			err = database.DB.QueryRow("SELECT status FROM user_session WHERE user_id = $1", userID).Scan(&currentStatus)
+			err := database.DB.QueryRow("SELECT status FROM user_session WHERE user_id = $1", userID).Scan(&currentStatus)
 			if err == sql.ErrNoRows {
 				currentStatus = "outside"
 			} else if err != nil {
 				fmt.Printf("Erro ao consultar status: %v\n", err)
+				_, _ = database.DB.Exec(`
+					INSERT INTO access_log (user_id, portal_id, event_time, confidence, event_type, cod_itens_venda)
+					VALUES ($1, $2, NOW(), $3, $4, NULL)
+				`, userID, portalID, confidence, eventType)
 				continue
 			}
 
 			if portalID == 1 { // ENTRADA
 				if currentStatus == "outside" {
-					// Verifica se ainda existe consumo não usado para hoje
+					// Verifica consumo disponível
 					var hasUnused bool
 					err = database.DB.QueryRow(`
 						SELECT EXISTS(
@@ -176,14 +171,22 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 					`, userID).Scan(&hasUnused)
 					if err != nil {
 						fmt.Printf("Erro ao verificar consumo: %v\n", err)
+						_, _ = database.DB.Exec(`
+							INSERT INTO access_log (user_id, portal_id, event_time, confidence, event_type, cod_itens_venda)
+							VALUES ($1, $2, NOW(), $3, $4, NULL)
+						`, userID, portalID, confidence, eventType)
 						continue
 					}
 					if !hasUnused {
 						fmt.Printf("⛔ Entrada bloqueada: user %d não possui consumo válido para hoje\n", userID)
+						_, _ = database.DB.Exec(`
+							INSERT INTO access_log (user_id, portal_id, event_time, confidence, event_type, cod_itens_venda)
+							VALUES ($1, $2, NOW(), $3, $4, NULL)
+						`, userID, portalID, confidence, eventType)
 						continue
 					}
 
-					// Atualiza status no banco para inside
+					// Atualiza status para inside
 					_, err = database.DB.Exec(`
 						INSERT INTO user_session (user_id, status, last_event_time, last_portal_id)
 						VALUES ($1, 'inside', NOW(), $2)
@@ -194,6 +197,10 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 					`, userID, portalID)
 					if err != nil {
 						fmt.Printf("Erro ao atualizar status (entrada): %v\n", err)
+						_, _ = database.DB.Exec(`
+							INSERT INTO access_log (user_id, portal_id, event_time, confidence, event_type, cod_itens_venda)
+							VALUES ($1, $2, NOW(), $3, $4, NULL)
+						`, userID, portalID, confidence, eventType)
 						continue
 					}
 					fmt.Printf("✅ Entrada registrada: user %d\n", userID)
@@ -210,59 +217,102 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 						fmt.Printf("✅ entrada_ocorrida atualizado para user %d\n", userID)
 					}
 
-					// 🔥 BUSCA O COD_CLIENTE ASSOCIADO AO USUÁRIO
+					// Busca cod_cliente
 					var codCliente int
 					err = database.DB.QueryRow(`SELECT cod_cliente FROM usuarios WHERE cod_usuario = $1`, userID).Scan(&codCliente)
 					if err != nil {
-						fmt.Printf("⚠️ Erro ao buscar cod_cliente para user %d: %v\n", userID, err)
+						fmt.Printf("⚠️ Erro ao buscar cod_cliente: %v\n", err)
+						_, _ = database.DB.Exec(`
+							INSERT INTO access_log (user_id, portal_id, event_time, confidence, event_type, cod_itens_venda)
+							VALUES ($1, $2, NOW(), $3, $4, NULL)
+						`, userID, portalID, confidence, eventType)
+						continue
+					}
+					fmt.Printf("🔍 Usuário %d → cliente %d\n", userID, codCliente)
+
+					// Conta itens pendentes (log apenas)
+					var count int
+					_ = database.DB.QueryRow(`
+						SELECT COUNT(*)
+						FROM itens_vendas iv
+						JOIN vendas v ON v.cod_venda = iv.cod_venda
+						WHERE iv.data_pedido = CURRENT_DATE
+						  AND iv.status != 3
+						  AND v.cod_cliente = $1
+					`, codCliente).Scan(&count)
+					fmt.Printf("🔍 Itens pendentes para cliente %d hoje: %d\n", codCliente, count)
+
+					// Obtém o primeiro cod_itens_venda pendente (se existir)
+					var codItemVenda sql.NullInt64
+					err = database.DB.QueryRow(`
+						SELECT MIN(iv.cod_itens_venda)
+						FROM itens_vendas iv
+						JOIN vendas v ON v.cod_venda = iv.cod_venda
+						WHERE iv.data_pedido = CURRENT_DATE
+						  AND iv.status != 3
+						  AND v.cod_cliente = $1
+					`, codCliente).Scan(&codItemVenda)
+					if err != nil && err != sql.ErrNoRows {
+						fmt.Printf("⚠️ Erro ao buscar item pendente: %v\n", err)
+					}
+
+					// Atualiza status dos itens pendentes para 3
+					updateQuery := `
+						UPDATE itens_vendas iv
+						SET status = 3
+						FROM vendas v
+						WHERE iv.cod_venda = v.cod_venda
+						  AND iv.data_pedido = CURRENT_DATE
+						  AND iv.status != 3
+						  AND v.cod_cliente = $1
+					`
+					result, err := database.DB.Exec(updateQuery, codCliente)
+					if err != nil {
+						fmt.Printf("⚠️ Erro ao atualizar status: %v\n", err)
 					} else {
-						fmt.Printf("🔍 Usuário %d → cliente %d\n", userID, codCliente)
+						rowsAffected, _ := result.RowsAffected()
+						fmt.Printf("✅ Status atualizado para cliente %d. Linhas afetadas: %d\n", codCliente, rowsAffected)
+					}
 
-						// 🔍 Conta quantos itens pendentes existem para este cliente hoje
-						var count int
-						countQuery := `
-        SELECT COUNT(*)
-        FROM itens_vendas iv
-        JOIN vendas v ON v.cod_venda = iv.cod_venda
-        WHERE iv.data_pedido = CURRENT_DATE
-          AND iv.status != 3
-          AND v.cod_cliente = $1
-    `
-						err = database.DB.QueryRow(countQuery, codCliente).Scan(&count)
-						if err != nil {
-							fmt.Printf("⚠️ Erro ao contar itens pendentes: %v\n", err)
+					// Insere log de entrada com o cod_itens_venda (pode ser NULL)
+					_, err = database.DB.Exec(`
+						INSERT INTO access_log (user_id, portal_id, event_time, confidence, event_type, cod_itens_venda)
+						VALUES ($1, $2, NOW(), $3, $4, $5)
+					`, userID, portalID, confidence, eventType, codItemVenda)
+					if err != nil {
+						fmt.Printf("Erro ao inserir access_log de entrada: %v\n", err)
+					} else {
+						if codItemVenda.Valid {
+							fmt.Printf("📝 Log de entrada com item %d inserido\n", codItemVenda.Int64)
 						} else {
-							fmt.Printf("🔍 Itens pendentes para cliente %d hoje: %d\n", codCliente, count)
-						}
-
-						// 🔥 ATUALIZA STATUS DO ITEM DE VENDA PARA 3 (consumido) – usando JOIN com vendas
-						updateQuery := `
-        UPDATE itens_vendas iv
-        SET status = 3
-        FROM vendas v
-        WHERE iv.cod_venda = v.cod_venda
-          AND iv.data_pedido = CURRENT_DATE
-          AND iv.status != 3
-          AND v.cod_cliente = $1
-    `
-						result, err := database.DB.Exec(updateQuery, codCliente)
-						if err != nil {
-							fmt.Printf("⚠️ Erro ao atualizar status do item de venda: %v\n", err)
-						} else {
-							rowsAffected, _ := result.RowsAffected()
-							if rowsAffected == 0 {
-								fmt.Printf("⚠️ Nenhum item de venda atualizado para cliente %d (nenhum pendente ou já consumido)\n", codCliente)
-							} else {
-								fmt.Printf("✅ Status do item de venda atualizado para 3 (consumido) para cliente %d. Linhas afetadas: %d\n", codCliente, rowsAffected)
-							}
+							fmt.Printf("📝 Log de entrada (sem item) inserido\n")
 						}
 					}
 				} else {
 					fmt.Printf("⛔ Tentativa de entrada bloqueada: user %d já está inside\n", userID)
+					_, _ = database.DB.Exec(`
+						INSERT INTO access_log (user_id, portal_id, event_time, confidence, event_type, cod_itens_venda)
+						VALUES ($1, $2, NOW(), $3, $4, NULL)
+					`, userID, portalID, confidence, eventType)
 				}
 			} else if portalID == 2 { // SAÍDA
+				// 🔥 Busca o cod_itens_venda que foi registrado na entrada mais recente do usuário hoje
+				var codItemVenda sql.NullInt64
+				err := database.DB.QueryRow(`
+					SELECT cod_itens_venda
+					FROM access_log
+					WHERE user_id = $1
+					  AND event_type = 'entry'
+					  AND DATE(event_time) = CURRENT_DATE
+					ORDER BY event_time DESC
+					LIMIT 1
+				`, userID).Scan(&codItemVenda)
+				if err != nil && err != sql.ErrNoRows {
+					fmt.Printf("⚠️ Erro ao buscar item da entrada: %v\n", err)
+				}
+
 				if currentStatus == "inside" {
-					// Atualiza status no banco para outside
+					// Atualiza status para outside
 					_, err = database.DB.Exec(`
 						UPDATE user_session SET status = 'outside', last_event_time = NOW(), last_portal_id = $1
 						WHERE user_id = $2
@@ -270,12 +320,35 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 					if err != nil {
 						fmt.Printf("Erro ao atualizar status (saída): %v\n", err)
 					} else {
-						fmt.Printf("🚪 Saída registrada: user %d.\n", userID)
-						// Remove usuário do dispositivo
-						go deleteUserFromDevice(userID)
+						fmt.Printf("🚪 Saída registrada: user %d\n", userID)
 					}
+					// Insere log de saída com o mesmo cod_itens_venda da entrada
+					_, err = database.DB.Exec(`
+						INSERT INTO access_log (user_id, portal_id, event_time, confidence, event_type, cod_itens_venda)
+						VALUES ($1, $2, NOW(), $3, $4, $5)
+					`, userID, portalID, confidence, eventType, codItemVenda)
+					if err != nil {
+						fmt.Printf("Erro ao inserir access_log de saída: %v\n", err)
+					} else {
+						if codItemVenda.Valid {
+							fmt.Printf("📝 Log de saída com item %d inserido para user %d\n", codItemVenda.Int64, userID)
+						} else {
+							fmt.Printf("📝 Log de saída (sem item) inserido para user %d\n", userID)
+						}
+					}
+					// Remove usuário do dispositivo
+					go deleteUserFromDevice(userID)
 				} else {
 					fmt.Printf("⚠️ Saída ignorada: user %d já estava fora\n", userID)
+					_, err = database.DB.Exec(`
+						INSERT INTO access_log (user_id, portal_id, event_time, confidence, event_type, cod_itens_venda)
+						VALUES ($1, $2, NOW(), $3, $4, $5)
+					`, userID, portalID, confidence, eventType, codItemVenda)
+					if err != nil {
+						fmt.Printf("Erro ao inserir access_log ignorado: %v\n", err)
+					} else {
+						fmt.Printf("📝 Log de saída ignorado (com item %v) inserido\n", codItemVenda)
+					}
 				}
 			}
 		}
