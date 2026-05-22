@@ -124,13 +124,13 @@ func refreshConsumoControle() error {
 		// Definir horários conforme o grupo
 		var horaInicio, horaFim string
 		switch codGrupo {
-		case 1: // Café da manhã
+		case 2: // Café da manhã
 			horaInicio = "06:00:00"
 			horaFim = "08:00:00"
-		case 2: // Almoço
+		case 3: // Almoço
 			horaInicio = "10:30:00"
 			horaFim = "14:00:00"
-		case 3: // Jantar
+		case 4: // Jantar
 			horaInicio = "17:00:00"
 			horaFim = "21:00:00"
 		default:
