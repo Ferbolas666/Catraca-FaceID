@@ -2,8 +2,8 @@ package config
 
 const (
 	IDFACE_IP = "192.168.1.130"
-	LOGIN     = "1234"
-	PASSWORD  = "12345"
+	LOGIN     = "123"
+	PASSWORD  = "1234"
 
 	DB_HOST     = "node259303-appetite-stafe.sp1.br.saveincloud.net.br"
 	DB_PORT     = "13367"
