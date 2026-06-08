@@ -61,7 +61,7 @@ func recreateUser(userID int) error {
 	var user models.User
 	var fotoBytes []byte
 	err := database.DB.QueryRow(`
-		SELECT cod_usuario, nome, matricula, foto
+		SELECT cod_usuario, nome, cpf, foto
 		FROM usuarios
 		WHERE cod_usuario = $1
 	`, userID).Scan(&user.ID, &user.Name, &user.Registration, &fotoBytes)
@@ -186,6 +186,20 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 						continue
 					}
 
+					// Busca o item_venda_id específico desse usuário (ainda não utilizado)
+					var codItemVenda sql.NullInt64
+					err = database.DB.QueryRow(`
+						SELECT item_venda_id
+						FROM consumo_controle
+						WHERE user_id = $1
+						  AND data_pedido = CURRENT_DATE
+						  AND entrada_ocorrida = FALSE
+						LIMIT 1
+					`, userID).Scan(&codItemVenda)
+					if err != nil && err != sql.ErrNoRows {
+						fmt.Printf("⚠️ Erro ao buscar item_venda_id: %v\n", err)
+					}
+
 					// Atualiza status para inside
 					_, err = database.DB.Exec(`
 						INSERT INTO user_session (user_id, status, last_event_time, last_portal_id)
@@ -199,13 +213,13 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 						fmt.Printf("Erro ao atualizar status (entrada): %v\n", err)
 						_, _ = database.DB.Exec(`
 							INSERT INTO access_log (user_id, portal_id, event_time, confidence, event_type, cod_itens_venda)
-							VALUES ($1, $2, NOW(), $3, $4, NULL)
-						`, userID, portalID, confidence, eventType)
+							VALUES ($1, $2, NOW(), $3, $4, $5)
+						`, userID, portalID, confidence, eventType, codItemVenda)
 						continue
 					}
 					fmt.Printf("✅ Entrada registrada: user %d\n", userID)
 
-					// Marca consumo utilizado
+					// Marca consumo como utilizado
 					_, err = database.DB.Exec(`
 						UPDATE consumo_controle
 						SET entrada_ocorrida = TRUE
@@ -217,64 +231,24 @@ func handleMonitorDAO(w http.ResponseWriter, body []byte) {
 						fmt.Printf("✅ entrada_ocorrida atualizado para user %d\n", userID)
 					}
 
-					// Busca cod_cliente
-					var codCliente int
-					err = database.DB.QueryRow(`SELECT cod_cliente FROM usuarios WHERE cod_usuario = $1`, userID).Scan(&codCliente)
-					if err != nil {
-						fmt.Printf("⚠️ Erro ao buscar cod_cliente: %v\n", err)
-						_, _ = database.DB.Exec(`
-							INSERT INTO access_log (user_id, portal_id, event_time, confidence, event_type, cod_itens_venda)
-							VALUES ($1, $2, NOW(), $3, $4, NULL)
-						`, userID, portalID, confidence, eventType)
-						continue
-					}
-					fmt.Printf("🔍 Usuário %d → cliente %d\n", userID, codCliente)
-
-					// Conta itens pendentes (log apenas)
-					var count int
-					_ = database.DB.QueryRow(`
-						SELECT COUNT(*)
-						FROM itens_vendas iv
-						JOIN vendas v ON v.cod_venda = iv.cod_venda
-						WHERE iv.data_pedido = CURRENT_DATE
-						  AND iv.status != 3
-						  AND v.cod_cliente = $1
-					`, codCliente).Scan(&count)
-					fmt.Printf("🔍 Itens pendentes para cliente %d hoje: %d\n", codCliente, count)
-
-					// Obtém o primeiro cod_itens_venda pendente (se existir)
-					var codItemVenda sql.NullInt64
-					err = database.DB.QueryRow(`
-						SELECT MIN(iv.cod_itens_venda)
-						FROM itens_vendas iv
-						JOIN vendas v ON v.cod_venda = iv.cod_venda
-						WHERE iv.data_pedido = CURRENT_DATE
-						  AND iv.status != 3
-						  AND v.cod_cliente = $1
-					`, codCliente).Scan(&codItemVenda)
-					if err != nil && err != sql.ErrNoRows {
-						fmt.Printf("⚠️ Erro ao buscar item pendente: %v\n", err)
-					}
-
-					// Atualiza status dos itens pendentes para 3
-					updateQuery := `
-						UPDATE itens_vendas iv
-						SET status = 3
-						FROM vendas v
-						WHERE iv.cod_venda = v.cod_venda
-						  AND iv.data_pedido = CURRENT_DATE
-						  AND iv.status != 3
-						  AND v.cod_cliente = $1
-					`
-					result, err := database.DB.Exec(updateQuery, codCliente)
-					if err != nil {
-						fmt.Printf("⚠️ Erro ao atualizar status: %v\n", err)
+					// Atualiza status do item_venda específico para 3
+					if codItemVenda.Valid {
+						result, err := database.DB.Exec(`
+							UPDATE itens_vendas
+							SET status = 3
+							WHERE cod_itens_venda = $1
+						`, codItemVenda.Int64)
+						if err != nil {
+							fmt.Printf("⚠️ Erro ao atualizar status do item %d: %v\n", codItemVenda.Int64, err)
+						} else {
+							rowsAffected, _ := result.RowsAffected()
+							fmt.Printf("✅ Item %d atualizado para status 3. Linhas afetadas: %d\n", codItemVenda.Int64, rowsAffected)
+						}
 					} else {
-						rowsAffected, _ := result.RowsAffected()
-						fmt.Printf("✅ Status atualizado para cliente %d. Linhas afetadas: %d\n", codCliente, rowsAffected)
+						fmt.Println("⚠️ Nenhum item_venda_id encontrado para o usuário, nenhum item atualizado.")
 					}
 
-					// Insere log de entrada com o cod_itens_venda (pode ser NULL)
+					// Insere log de entrada com o cod_itens_venda
 					_, err = database.DB.Exec(`
 						INSERT INTO access_log (user_id, portal_id, event_time, confidence, event_type, cod_itens_venda)
 						VALUES ($1, $2, NOW(), $3, $4, $5)
@@ -365,15 +339,15 @@ func handleUserIdentified(w http.ResponseWriter, body []byte) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	userMatricula := values.Get("registration")
+	userCPF := values.Get("registration") // agora o campo registration contém o CPF
 	userName := values.Get("user_name")
 	portalID, _ := strconv.Atoi(values.Get("portal_id"))
 
 	var userID int
-	err = database.DB.QueryRow(`SELECT cod_usuario FROM usuarios WHERE matricula = $1`, userMatricula).Scan(&userID)
+	err = database.DB.QueryRow(`SELECT cod_usuario FROM usuarios WHERE cpf = $1`, userCPF).Scan(&userID)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			fmt.Printf("❌ Matrícula %s não encontrada.\n", userMatricula)
+			fmt.Printf("❌ CPF %s não encontrado.\n", userCPF)
 		} else {
 			fmt.Printf("Erro ao buscar usuário: %v\n", err)
 		}
