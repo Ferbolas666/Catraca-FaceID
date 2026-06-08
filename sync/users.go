@@ -24,20 +24,20 @@ func SyncUsers(session string) error {
 		fmt.Printf("Erro ao atualizar consumo_controle: %v\n", err)
 	}
 
-	// 2. Obter lista de matrículas autorizadas (todas que aparecem em consumo_controle hoje)
-	allowedMatriculas, err := getAllowedMatriculasFromControle()
+	// 2. Obter lista de CPFs autorizados (todos que aparecem em consumo_controle hoje)
+	allowedCPFs, err := getAllowedCPFsFromControle()
 	if err != nil {
 		return fmt.Errorf("erro ao obter autorizados: %v", err)
 	}
 
-	if len(allowedMatriculas) == 0 {
+	if len(allowedCPFs) == 0 {
 		fmt.Println("Nenhum usuário autorizado hoje. Removendo todos os usuários do dispositivo.")
 		return removeAllDeviceUsers(session)
 	}
 
 	// 3. Buscar usuários que ainda NÃO entraram hoje e que estão dentro do horário atual
 	rows, err := database.DB.Query(`
-		SELECT u.cod_usuario, u.nome, u.matricula, u.foto,
+		SELECT u.cod_usuario, u.nome, u.cpf, u.foto,
 		       cc.hora_inicio, cc.hora_fim
 		FROM usuarios u
 		JOIN consumo_controle cc ON cc.user_id = u.cod_usuario
@@ -55,13 +55,14 @@ func SyncUsers(session string) error {
 		var user models.User
 		var fotoBytes []byte
 		var horaInicio, horaFim string
+		// O campo `Registration` receberá o CPF
 		if err := rows.Scan(&user.ID, &user.Name, &user.Registration, &fotoBytes, &horaInicio, &horaFim); err != nil {
 			fmt.Println("ERRO SCAN:", err)
 			continue
 		}
 		fmt.Printf("HORÁRIO PERMITIDO para %s: %s - %s (agora: %s)\n", user.Name, horaInicio, horaFim, time.Now().Format("15:04:05"))
 
-		// Envia usuário
+		// Envia usuário (o CPF será usado como identificador no dispositivo)
 		if err := idface.CreateOrModifyUser(session, user); err != nil {
 			fmt.Printf("ERRO AO ENVIAR %s: %v\n", user.Name, err)
 			continue
@@ -77,13 +78,13 @@ func SyncUsers(session string) error {
 		} else {
 			fmt.Printf("Regra de acesso associada para %s\n", user.Name)
 		}
-		fmt.Printf("SINCRONIZADO: %s (matrícula %s)\n", user.Name, user.Registration)
+		fmt.Printf("SINCRONIZADO: %s (CPF %s)\n", user.Name, user.Registration)
 		enviados++
 	}
 	fmt.Printf("Total de usuários enviados nesta rodada: %d\n", enviados)
 
-	// 4. Remover do dispositivo usuários que NÃO estão em nenhum pedido de hoje
-	if err := removeUnauthorizedUsers(session, allowedMatriculas); err != nil {
+	// 4. Remover do dispositivo usuários cujo CPF NÃO está na lista de autorizados
+	if err := removeUnauthorizedUsers(session, allowedCPFs); err != nil {
 		fmt.Printf("Erro ao remover usuários não autorizados: %v\n", err)
 	}
 
@@ -138,20 +139,22 @@ func refreshConsumoControle() error {
 			continue
 		}
 
-		var matriculas []string
-		if err := json.Unmarshal([]byte(jsonArray), &matriculas); err != nil {
+		// O JSON agora contém strings como "Nome Completo - 123.456.789-00"
+		var cpfs []string
+		if err := json.Unmarshal([]byte(jsonArray), &cpfs); err != nil {
 			continue
 		}
-		for _, m := range matriculas {
-			parts := strings.Split(m, " - ")
+		for _, entry := range cpfs {
+			parts := strings.Split(entry, " - ")
 			if len(parts) < 2 {
 				continue
 			}
-			matricula := strings.TrimSpace(parts[len(parts)-1])
+			cpf := strings.TrimSpace(parts[len(parts)-1])
 			var userID int
-			err = database.DB.QueryRow(`SELECT cod_usuario FROM usuarios WHERE matricula = $1`, matricula).Scan(&userID)
+			// Busca o usuário pelo CPF
+			err = database.DB.QueryRow(`SELECT cod_usuario FROM usuarios WHERE cpf = $1`, cpf).Scan(&userID)
 			if err != nil {
-				fmt.Printf("Matrícula %s não encontrada: %v\n", matricula, err)
+				fmt.Printf("CPF %s não encontrado: %v\n", cpf, err)
 				continue
 			}
 			// Insere registro com os horários específicos do grupo
@@ -168,10 +171,10 @@ func refreshConsumoControle() error {
 	return nil
 }
 
-// getAllowedMatriculasFromControle retorna todas as matrículas que aparecem em consumo_controle para hoje
-func getAllowedMatriculasFromControle() (map[string]bool, error) {
+// getAllowedCPFsFromControle retorna todos os CPFs que aparecem em consumo_controle para hoje
+func getAllowedCPFsFromControle() (map[string]bool, error) {
 	rows, err := database.DB.Query(`
-		SELECT u.matricula
+		SELECT u.cpf
 		FROM consumo_controle cc
 		JOIN usuarios u ON u.cod_usuario = cc.user_id
 		WHERE cc.data_pedido = CURRENT_DATE
@@ -183,25 +186,26 @@ func getAllowedMatriculasFromControle() (map[string]bool, error) {
 
 	allowed := make(map[string]bool)
 	for rows.Next() {
-		var matricula string
-		if err := rows.Scan(&matricula); err != nil {
+		var cpf string
+		if err := rows.Scan(&cpf); err != nil {
 			continue
 		}
-		allowed[matricula] = true
+		allowed[cpf] = true
 	}
 	return allowed, nil
 }
 
-// removeUnauthorizedUsers busca todos os usuários do dispositivo e remove aqueles cuja matrícula não está em allowedMatriculas.
-func removeUnauthorizedUsers(session string, allowedMatriculas map[string]bool) error {
+// removeUnauthorizedUsers busca todos os usuários do dispositivo e remove aqueles cujo CPF não está em allowedCPFs.
+func removeUnauthorizedUsers(session string, allowedCPFs map[string]bool) error {
 	deviceUsers, err := getAllDeviceUsers(session)
 	if err != nil {
 		return err
 	}
 
 	for _, u := range deviceUsers {
-		if !allowedMatriculas[u.Registration] {
-			fmt.Printf("Removendo usuário não autorizado: %s (ID %d, matrícula %s)\n", u.Name, u.ID, u.Registration)
+		// `u.Registration` agora contém o CPF
+		if !allowedCPFs[u.Registration] {
+			fmt.Printf("Removendo usuário não autorizado: %s (ID %d, CPF %s)\n", u.Name, u.ID, u.Registration)
 			if err := deleteUserFromDevice(session, u.ID); err != nil {
 				fmt.Printf("Falha ao remover usuário %d: %v\n", u.ID, err)
 			}
@@ -229,7 +233,7 @@ func removeAllDeviceUsers(session string) error {
 func getAllDeviceUsers(session string) ([]struct {
 	ID           int    `json:"id"`
 	Name         string `json:"name"`
-	Registration string `json:"registration"`
+	Registration string `json:"registration"` // campo do dispositivo, agora preenchido com o CPF
 	Enabled      string `json:"enabled"`
 }, error) {
 	url := fmt.Sprintf("http://%s/load_objects.fcgi?session=%s", config.IDFACE_IP, session)
